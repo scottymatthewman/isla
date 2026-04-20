@@ -15,6 +15,10 @@ struct Secret: Identifiable, Codable, Hashable {
     var environments: [String]
     var provider: String?
     var notes: String?
+    var providerMetadata: ProviderMetadata?
+    var rotationCapability: RotationCapability
+    var lastRotatedAt: Date?
+    var rotationHistory: [RotationHistoryEntry]
     var createdAt: Date
     var updatedAt: Date
 
@@ -27,6 +31,10 @@ struct Secret: Identifiable, Codable, Hashable {
         case environment
         case provider
         case notes
+        case providerMetadata
+        case rotationCapability
+        case lastRotatedAt
+        case rotationHistory
         case createdAt
         case updatedAt
     }
@@ -39,6 +47,10 @@ struct Secret: Identifiable, Codable, Hashable {
         environments: [String],
         provider: String?,
         notes: String?,
+        providerMetadata: ProviderMetadata? = nil,
+        rotationCapability: RotationCapability = .manual,
+        lastRotatedAt: Date? = nil,
+        rotationHistory: [RotationHistoryEntry] = [],
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -49,6 +61,10 @@ struct Secret: Identifiable, Codable, Hashable {
         self.environments = environments
         self.provider = provider
         self.notes = notes
+        self.providerMetadata = providerMetadata
+        self.rotationCapability = rotationCapability
+        self.lastRotatedAt = lastRotatedAt
+        self.rotationHistory = rotationHistory
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -70,6 +86,10 @@ struct Secret: Identifiable, Codable, Hashable {
 
         provider = try container.decodeIfPresent(String.self, forKey: .provider)
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        providerMetadata = try container.decodeIfPresent(ProviderMetadata.self, forKey: .providerMetadata)
+        rotationCapability = try container.decodeIfPresent(RotationCapability.self, forKey: .rotationCapability) ?? .manual
+        lastRotatedAt = try container.decodeIfPresent(Date.self, forKey: .lastRotatedAt)
+        rotationHistory = try container.decodeIfPresent([RotationHistoryEntry].self, forKey: .rotationHistory) ?? []
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
@@ -83,9 +103,32 @@ struct Secret: Identifiable, Codable, Hashable {
         try container.encode(environments, forKey: .environments)
         try container.encodeIfPresent(provider, forKey: .provider)
         try container.encodeIfPresent(notes, forKey: .notes)
+        try container.encodeIfPresent(providerMetadata, forKey: .providerMetadata)
+        try container.encode(rotationCapability, forKey: .rotationCapability)
+        try container.encodeIfPresent(lastRotatedAt, forKey: .lastRotatedAt)
+        try container.encode(rotationHistory, forKey: .rotationHistory)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
     }
+}
+
+struct ProviderMetadata: Codable, Hashable {
+    var normalizedName: String
+    var displayName: String
+}
+
+enum RotationCapability: String, Codable, CaseIterable, Identifiable {
+    case manual
+    case adapterSupported = "adapter-supported"
+
+    var id: String { rawValue }
+}
+
+struct RotationHistoryEntry: Identifiable, Codable, Hashable {
+    let id: UUID
+    let rotatedAt: Date
+    let source: String
+    let note: String?
 }
 
 struct AppMetadata: Codable {
@@ -118,4 +161,26 @@ struct LegacyAppMetadata: Codable {
     var workspaces: [Workspace]
     var projects: [LegacyProject]
     var secrets: [LegacySecret]
+}
+
+enum ImportConflictStrategy: String, CaseIterable, Identifiable, Codable {
+    case skip = "Skip"
+    case overwrite = "Overwrite"
+    case rename = "Rename"
+
+    var id: String { rawValue }
+}
+
+struct EnvImportEntry: Identifiable, Hashable {
+    let id = UUID()
+    let lineNumber: Int
+    let key: String
+    let value: String
+}
+
+struct EnvImportSummary {
+    let parsed: Int
+    let imported: Int
+    let skipped: Int
+    let failed: Int
 }

@@ -66,7 +66,22 @@ final class AppStore: ObservableObject {
         persist()
     }
 
-    func addSecret(workspaceID: UUID, key: String, value: String, environments: [String], provider: String?) throws {
+    func moveWorkspaces(fromOffsets: IndexSet, toOffset: Int) {
+        let sourceIndices = fromOffsets.sorted()
+        let movingItems = sourceIndices.map { workspaces[$0] }
+
+        for index in sourceIndices.reversed() {
+            workspaces.remove(at: index)
+        }
+
+        let numberOfRemovedBeforeDestination = sourceIndices.filter { $0 < toOffset }.count
+        let adjustedOffset = toOffset - numberOfRemovedBeforeDestination
+        let clampedOffset = max(0, min(adjustedOffset, workspaces.count))
+        workspaces.insert(contentsOf: movingItems, at: clampedOffset)
+        persist()
+    }
+
+    func addSecret(workspaceID: UUID, key: String, value: String, environments: [String], provider: String?, notes: String? = nil) throws {
         let cleanedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedEnvironments = environments
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -83,8 +98,8 @@ final class AppStore: ObservableObject {
         let account = "secret-\(UUID().uuidString)"
         try keychain.save(value: value, account: account)
 
-        let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanedProvider = (normalizedProvider?.isEmpty == true) ? nil : normalizedProvider
+        let cleanedProvider = normalizeProvider(provider)
+        let cleanedNotes = normalizeNotes(notes)
 
         secrets.append(
             Secret(
@@ -94,7 +109,11 @@ final class AppStore: ObservableObject {
                 keychainAccount: account,
                 environments: cleanedEnvironments,
                 provider: cleanedProvider,
-                notes: nil,
+                notes: cleanedNotes,
+                providerMetadata: providerMetadata(for: cleanedProvider),
+                rotationCapability: .manual,
+                lastRotatedAt: nil,
+                rotationHistory: [],
                 createdAt: now,
                 updatedAt: now
             )
@@ -107,7 +126,8 @@ final class AppStore: ObservableObject {
         key: String,
         value: String?,
         environments: [String],
-        provider: String?
+        provider: String?,
+        notes: String?
     ) throws {
         let cleanedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedEnvironments = environments
@@ -134,12 +154,86 @@ final class AppStore: ObservableObject {
             try keychain.save(value: value, account: secret.keychainAccount)
         }
 
-        let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanedProvider = (normalizedProvider?.isEmpty == true) ? nil : normalizedProvider
+        let cleanedProvider = normalizeProvider(provider)
+        let cleanedNotes = normalizeNotes(notes)
 
         secrets[index].key = cleanedKey
         secrets[index].environments = cleanedEnvironments
         secrets[index].provider = cleanedProvider
+        secrets[index].notes = cleanedNotes
+        secrets[index].providerMetadata = providerMetadata(for: cleanedProvider)
+        secrets[index].updatedAt = Date()
+        persist()
+    }
+
+    func updateSecretQuickFields(secretID: UUID, environments: [String]? = nil, provider: String? = nil, notes: String? = nil) throws {
+        guard let index = secrets.firstIndex(where: { $0.id == secretID }) else {
+            throw AppStoreError.notFound
+        }
+        let secret = secrets[index]
+
+        if let environments {
+            let cleanedEnvironments = environments
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            guard !cleanedEnvironments.isEmpty else {
+                throw AppStoreError.invalidInput
+            }
+            guard !hasDuplicateSecret(
+                workspaceID: secret.workspaceID,
+                key: secret.key,
+                environments: cleanedEnvironments,
+                excluding: secret.id
+            ) else {
+                throw AppStoreError.duplicateSecret
+            }
+            secrets[index].environments = cleanedEnvironments
+        }
+
+        if provider != nil {
+            let cleanedProvider = normalizeProvider(provider)
+            secrets[index].provider = cleanedProvider
+            secrets[index].providerMetadata = providerMetadata(for: cleanedProvider)
+        }
+
+        if notes != nil {
+            secrets[index].notes = normalizeNotes(notes)
+        }
+
+        secrets[index].updatedAt = Date()
+        persist()
+    }
+
+    func updateSecretInline(secretID: UUID, key: String? = nil, value: String? = nil) throws {
+        guard let index = secrets.firstIndex(where: { $0.id == secretID }) else {
+            throw AppStoreError.notFound
+        }
+
+        if let key {
+            let cleanedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanedKey.isEmpty else {
+                throw AppStoreError.invalidInput
+            }
+            let secret = secrets[index]
+            guard !hasDuplicateSecret(
+                workspaceID: secret.workspaceID,
+                key: cleanedKey,
+                environments: secret.environments,
+                excluding: secret.id
+            ) else {
+                throw AppStoreError.duplicateSecret
+            }
+            secrets[index].key = cleanedKey
+        }
+
+        if let value {
+            let cleanedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanedValue.isEmpty else {
+                throw AppStoreError.invalidInput
+            }
+            try keychain.save(value: cleanedValue, account: secrets[index].keychainAccount)
+        }
+
         secrets[index].updatedAt = Date()
         persist()
     }
@@ -156,6 +250,109 @@ final class AppStore: ObservableObject {
             return nil
         }
         return try? keychain.read(account: secret.keychainAccount)
+    }
+
+    func importEnvEntries(
+        workspaceID: UUID,
+        entries: [EnvImportEntry],
+        environments: [String],
+        provider: String?,
+        strategy: ImportConflictStrategy
+    ) -> EnvImportSummary {
+        let cleanedEnvironments = environments
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !cleanedEnvironments.isEmpty else {
+            return EnvImportSummary(parsed: entries.count, imported: 0, skipped: 0, failed: entries.count)
+        }
+
+        var imported = 0
+        var skipped = 0
+        var failed = 0
+        let cleanedProvider = normalizeProvider(provider)
+
+        for entry in entries {
+            let conflict = firstConflictSecret(
+                workspaceID: workspaceID,
+                key: entry.key,
+                environments: cleanedEnvironments
+            )
+
+            switch strategy {
+            case .skip:
+                if conflict != nil {
+                    skipped += 1
+                    continue
+                }
+                do {
+                    try addSecret(
+                        workspaceID: workspaceID,
+                        key: entry.key,
+                        value: entry.value,
+                        environments: cleanedEnvironments,
+                        provider: cleanedProvider
+                    )
+                    imported += 1
+                } catch {
+                    failed += 1
+                }
+            case .overwrite:
+                if let conflict {
+                    do {
+                        try keychain.save(value: entry.value, account: conflict.keychainAccount)
+                        if let index = secrets.firstIndex(where: { $0.id == conflict.id }) {
+                            secrets[index].provider = cleanedProvider ?? secrets[index].provider
+                            secrets[index].providerMetadata = providerMetadata(for: secrets[index].provider)
+                            let merged = Set(secrets[index].environments).union(cleanedEnvironments)
+                            secrets[index].environments = Array(merged).sorted()
+                            secrets[index].updatedAt = Date()
+                        }
+                        persist()
+                        imported += 1
+                    } catch {
+                        failed += 1
+                    }
+                } else {
+                    do {
+                        try addSecret(
+                            workspaceID: workspaceID,
+                            key: entry.key,
+                            value: entry.value,
+                            environments: cleanedEnvironments,
+                            provider: cleanedProvider
+                        )
+                        imported += 1
+                    } catch {
+                        failed += 1
+                    }
+                }
+            case .rename:
+                let keyToUse = uniqueKeyForImport(
+                    workspaceID: workspaceID,
+                    originalKey: entry.key,
+                    environments: cleanedEnvironments
+                )
+                do {
+                    try addSecret(
+                        workspaceID: workspaceID,
+                        key: keyToUse,
+                        value: entry.value,
+                        environments: cleanedEnvironments,
+                        provider: cleanedProvider
+                    )
+                    imported += 1
+                } catch {
+                    failed += 1
+                }
+            }
+        }
+
+        return EnvImportSummary(
+            parsed: entries.count,
+            imported: imported,
+            skipped: skipped,
+            failed: failed
+        )
     }
 
     private func load() {
@@ -176,7 +373,13 @@ final class AppStore: ObservableObject {
             let data = try Data(contentsOf: metadataURL)
             if let metadata = try? decoder.decode(AppMetadata.self, from: data) {
                 workspaces = metadata.workspaces
-                secrets = metadata.secrets
+                secrets = metadata.secrets.map { secret in
+                    var normalized = secret
+                    if normalized.providerMetadata == nil {
+                        normalized.providerMetadata = providerMetadata(for: normalized.provider)
+                    }
+                    return normalized
+                }
             } else {
                 let legacy = try decoder.decode(LegacyAppMetadata.self, from: data)
                 let migratedSecrets: [Secret] = legacy.secrets.compactMap { legacySecret in
@@ -196,7 +399,13 @@ final class AppStore: ObservableObject {
                     )
                 }
                 workspaces = legacy.workspaces
-                secrets = migratedSecrets
+                secrets = migratedSecrets.map { secret in
+                    var normalized = secret
+                    if normalized.providerMetadata == nil {
+                        normalized.providerMetadata = providerMetadata(for: normalized.provider)
+                    }
+                    return normalized
+                }
                 persist()
             }
         } catch {
@@ -235,6 +444,47 @@ final class AppStore: ObservableObject {
                 secret.key.lowercased() == normalizedKey &&
                 !existingEnvironments.isDisjoint(with: normalizedEnvironments)
         }
+    }
+
+    private func firstConflictSecret(workspaceID: UUID, key: String, environments: [String]) -> Secret? {
+        let normalizedKey = key.lowercased()
+        let normalizedEnvironments = Set(environments.map { $0.lowercased() })
+        return secrets.first { secret in
+            let existingEnvironments = Set(secret.environments.map { $0.lowercased() })
+            return secret.workspaceID == workspaceID &&
+                secret.key.lowercased() == normalizedKey &&
+                !existingEnvironments.isDisjoint(with: normalizedEnvironments)
+        }
+    }
+
+    private func uniqueKeyForImport(workspaceID: UUID, originalKey: String, environments: [String]) -> String {
+        var counter = 1
+        var candidate = originalKey
+        while hasDuplicateSecret(workspaceID: workspaceID, key: candidate, environments: environments, excluding: nil) {
+            candidate = "\(originalKey)_\(counter)"
+            counter += 1
+        }
+        return candidate
+    }
+
+    private func normalizeProvider(_ provider: String?) -> String? {
+        let normalizedProvider = provider?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (normalizedProvider?.isEmpty == true) ? nil : normalizedProvider
+    }
+
+    private func normalizeNotes(_ notes: String?) -> String? {
+        let normalized = notes?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (normalized?.isEmpty == true) ? nil : normalized
+    }
+
+    private func providerMetadata(for provider: String?) -> ProviderMetadata? {
+        guard let provider else { return nil }
+        let normalized = provider
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "_", with: "-")
+        return ProviderMetadata(normalizedName: normalized, displayName: provider)
     }
 }
 

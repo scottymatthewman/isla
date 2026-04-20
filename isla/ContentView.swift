@@ -10,6 +10,13 @@ private enum SecretSortOption: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private enum SecretSortColumn {
+    case key
+    case environment
+    case provider
+    case updatedAt
+}
+
 private enum ProviderFilter: String, CaseIterable, Identifiable {
     case all = "All"
     case withProvider = "Has Provider"
@@ -26,12 +33,15 @@ struct ContentView: View {
     @State private var showNewSecret = false
     @State private var showRenameWorkspace = false
     @State private var showDeleteWorkspaceConfirmation = false
+    @State private var showEnvImport = false
     @State private var searchText = ""
     @State private var createSecretError: String?
+    @State private var importSummary: EnvImportSummary?
     @State private var hoveredSecretID: UUID?
     @State private var editingSecret: Secret?
     @State private var deletingSecret: Secret?
     @State private var copiedIndicator: CopiedIndicator?
+    @State private var focusedSecretID: UUID?
     @State private var selectedEnvironmentFilters: Set<String> = []
     @State private var providerFilter: ProviderFilter = .all
     @State private var sortOption: SecretSortOption = .updatedNewest
@@ -79,6 +89,7 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
+                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 360)
         } detail: {
             secretTableView
         }
@@ -92,14 +103,15 @@ struct ContentView: View {
             NewSecretSheet(
                 workspaceID: selectedWorkspaceID,
                 workspaces: store.workspaces
-            ) { workspaceID, key, value, environments, provider in
+            ) { workspaceID, key, value, environments, provider, notes in
                 do {
                     try store.addSecret(
                         workspaceID: workspaceID,
                         key: key,
                         value: value,
                         environments: environments,
-                        provider: provider
+                        provider: provider,
+                        notes: notes
                     )
                     createSecretError = nil
                 } catch {
@@ -107,15 +119,31 @@ struct ContentView: View {
                 }
             }
         }
+        .sheet(isPresented: $showEnvImport) {
+            EnvImportSheet(
+                selectedWorkspaceID: selectedWorkspaceID,
+                workspaces: store.workspaces
+            ) { workspaceID, entries, environments, provider, strategy in
+                let summary = store.importEnvEntries(
+                    workspaceID: workspaceID,
+                    entries: entries,
+                    environments: environments,
+                    provider: provider,
+                    strategy: strategy
+                )
+                importSummary = summary
+            }
+        }
         .sheet(item: $editingSecret) { secret in
-            EditSecretSheet(secret: secret) { key, value, environments, provider in
+            EditSecretSheet(secret: secret) { key, value, environments, provider, notes in
                 do {
                     try store.updateSecret(
                         secretID: secret.id,
                         key: key,
                         value: value,
                         environments: environments,
-                        provider: provider
+                        provider: provider,
+                        notes: notes
                     )
                     createSecretError = nil
                 } catch {
@@ -170,7 +198,7 @@ struct ContentView: View {
 
     private var sidebar: some View {
         List(selection: $selectedWorkspaceID) {
-            ForEach(store.workspaces.sorted(by: { $0.name < $1.name })) { workspace in
+            ForEach(store.workspaces) { workspace in
                 Label(workspace.name, systemImage: "folder")
                     .tag(workspace.id)
                     .contextMenu {
@@ -183,6 +211,9 @@ struct ContentView: View {
                             showDeleteWorkspaceConfirmation = true
                         }
                     }
+            }
+            .onMove { indices, newOffset in
+                store.moveWorkspaces(fromOffsets: indices, toOffset: newOffset)
             }
         }
         .toolbar {
@@ -217,6 +248,12 @@ struct ContentView: View {
                     Label("New Secret", systemImage: "plus")
                 }
                 .disabled(selectedWorkspaceID == nil)
+                Button {
+                    showEnvImport = true
+                } label: {
+                    Label("Import .env", systemImage: "square.and.arrow.down")
+                }
+                .disabled(store.workspaces.isEmpty)
             }
 
             HStack(spacing: 12) {
@@ -243,7 +280,7 @@ struct ContentView: View {
                 EnvironmentFilterPill(title: "Dev", isSelected: selectedEnvironmentFilters.contains("dev")) {
                     toggleEnvironmentFilter("dev")
                 }
-                EnvironmentFilterPill(title: "Stagin", isSelected: selectedEnvironmentFilters.contains("staging")) {
+                EnvironmentFilterPill(title: "Staging", isSelected: selectedEnvironmentFilters.contains("staging")) {
                     toggleEnvironmentFilter("staging")
                 }
                 EnvironmentFilterPill(title: "Prod", isSelected: selectedEnvironmentFilters.contains("prod")) {
@@ -263,6 +300,11 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if let importSummary {
+                Text("Import finished: parsed \(importSummary.parsed), imported \(importSummary.imported), skipped \(importSummary.skipped), failed \(importSummary.failed).")
+                    .font(.caption)
+                    .foregroundStyle(importSummary.failed > 0 ? .orange : .secondary)
+            }
 
             if selectedWorkspaceID == nil {
                 ContentUnavailableView("Select a workspace", systemImage: "sidebar.left")
@@ -273,32 +315,88 @@ struct ContentView: View {
                 )
             } else {
                 VStack(spacing: 0) {
-                    SecretTableHeaderRow()
-                    ForEach(visibleSecrets) { secret in
-                        SecretTableRow(
-                            secret: secret,
-                            environmentText: secret.environments.map(displayName(forEnvironment:)).joined(separator: ", "),
-                            isHovered: hoveredSecretID == secret.id,
-                            isKeyCopied: copiedIndicator == .key(secret.id),
-                            isValueCopied: copiedIndicator == .value(secret.id),
-                            onCopyKey: {
-                                copySecretKey(secret)
-                            },
-                            onCopyValue: {
-                                copySecretValue(secret)
-                            },
-                            onEdit: {
-                                editingSecret = secret
-                            },
-                            onDelete: {
-                                deletingSecret = secret
-                            }
-                        )
-                        .onHover { isHovering in
-                            if isHovering {
-                                hoveredSecretID = secret.id
-                            } else if hoveredSecretID == secret.id {
-                                hoveredSecretID = nil
+                    SecretTableHeaderRow { column in
+                        sortByColumn(column)
+                    }
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(visibleSecrets) { secret in
+                                SecretTableRow(
+                                    secret: secret,
+                                    environmentText: secret.environments.map(displayName(forEnvironment:)).joined(separator: ", "),
+                                    isHovered: hoveredSecretID == secret.id,
+                                    isFocused: focusedSecretID == secret.id,
+                                    isKeyCopied: copiedIndicator == .key(secret.id),
+                                    isValueCopied: copiedIndicator == .value(secret.id),
+                                    onCopyKey: {
+                                        copySecretKey(secret)
+                                    },
+                                    onCopyValue: {
+                                        copySecretValue(secret)
+                                    },
+                                    onReadValue: {
+                                        store.readSecretValue(secretID: secret.id)
+                                    },
+                                    onInlineRename: { updatedKey in
+                                        do {
+                                            try store.updateSecretInline(secretID: secret.id, key: updatedKey)
+                                            createSecretError = nil
+                                        } catch {
+                                            createSecretError = (error as? LocalizedError)?.errorDescription ?? "Could not update secret key."
+                                        }
+                                    },
+                                    onInlineValueUpdate: { updatedValue in
+                                        do {
+                                            try store.updateSecretInline(secretID: secret.id, value: updatedValue)
+                                            createSecretError = nil
+                                        } catch {
+                                            createSecretError = (error as? LocalizedError)?.errorDescription ?? "Could not update secret value."
+                                        }
+                                    },
+                                    onEdit: {
+                                        editingSecret = secret
+                                    },
+                                    onDelete: {
+                                        deletingSecret = secret
+                                    },
+                                    onQuickUpdateProvider: { provider in
+                                        try? store.updateSecretQuickFields(secretID: secret.id, provider: provider)
+                                    },
+                                    onQuickUpdateEnvironments: { environments in
+                                        do {
+                                            try store.updateSecretQuickFields(secretID: secret.id, environments: environments)
+                                            createSecretError = nil
+                                        } catch {
+                                            createSecretError = (error as? LocalizedError)?.errorDescription ?? "Could not update environments."
+                                        }
+                                    }
+                                )
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    focusedSecretID = secret.id
+                                }
+                                .contextMenu {
+                                    Button("Copy Key") {
+                                        copySecretKey(secret)
+                                    }
+                                    Button("Copy Value") {
+                                        copySecretValue(secret)
+                                    }
+                                    Button("Edit") {
+                                        editingSecret = secret
+                                    }
+                                    Divider()
+                                    Button("Delete", role: .destructive) {
+                                        deletingSecret = secret
+                                    }
+                                }
+                                .onHover { isHovering in
+                                    if isHovering {
+                                        hoveredSecretID = secret.id
+                                    } else if hoveredSecretID == secret.id {
+                                        hoveredSecretID = nil
+                                    }
+                                }
                             }
                         }
                     }
@@ -308,10 +406,25 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                 )
+                .focusable()
+                .onMoveCommand { direction in
+                    moveFocus(direction: direction)
+                }
             }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background {
+            Group {
+                Button("", action: copyFocusedSecretValue)
+                    .keyboardShortcut("c", modifiers: [.command])
+                Button("", action: editFocusedSecret)
+                    .keyboardShortcut(.return, modifiers: [])
+                Button("", action: promptDeleteFocusedSecret)
+                    .keyboardShortcut(.delete, modifiers: [])
+            }
+            .hidden()
+        }
     }
 
     private func copySecretValue(_ secret: Secret) {
@@ -319,6 +432,7 @@ struct ContentView: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(value, forType: .string)
             copiedIndicator = .value(secret.id)
+            focusedSecretID = secret.id
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 if copiedIndicator == .value(secret.id) {
                     copiedIndicator = nil
@@ -331,11 +445,59 @@ struct ContentView: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(secret.key, forType: .string)
         copiedIndicator = .key(secret.id)
+        focusedSecretID = secret.id
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             if copiedIndicator == .key(secret.id) {
                 copiedIndicator = nil
             }
         }
+    }
+
+    private func sortByColumn(_ column: SecretSortColumn) {
+        switch column {
+        case .key:
+            sortOption = sortOption == .keyAToZ ? .keyZToA : .keyAToZ
+        case .updatedAt:
+            sortOption = sortOption == .updatedNewest ? .updatedOldest : .updatedNewest
+        case .environment, .provider:
+            break
+        }
+    }
+
+    private func moveFocus(direction: MoveCommandDirection) {
+        guard !visibleSecrets.isEmpty else { return }
+        guard let focusedSecretID,
+              let currentIndex = visibleSecrets.firstIndex(where: { $0.id == focusedSecretID }) else {
+            self.focusedSecretID = visibleSecrets.first?.id
+            return
+        }
+
+        switch direction {
+        case .up:
+            self.focusedSecretID = visibleSecrets[max(0, currentIndex - 1)].id
+        case .down:
+            self.focusedSecretID = visibleSecrets[min(visibleSecrets.count - 1, currentIndex + 1)].id
+        default:
+            break
+        }
+    }
+
+    private func copyFocusedSecretValue() {
+        guard let focusedSecretID,
+              let secret = visibleSecrets.first(where: { $0.id == focusedSecretID }) else { return }
+        copySecretValue(secret)
+    }
+
+    private func editFocusedSecret() {
+        guard let focusedSecretID,
+              let secret = visibleSecrets.first(where: { $0.id == focusedSecretID }) else { return }
+        editingSecret = secret
+    }
+
+    private func promptDeleteFocusedSecret() {
+        guard let focusedSecretID,
+              let secret = visibleSecrets.first(where: { $0.id == focusedSecretID }) else { return }
+        deletingSecret = secret
     }
 
     private func toggleEnvironmentFilter(_ environment: String) {
@@ -366,20 +528,24 @@ private enum CopiedIndicator: Equatable {
 }
 
 private struct SecretTableHeaderRow: View {
+    let onSort: (SecretSortColumn) -> Void
+
     var body: some View {
         HStack(spacing: 12) {
-            Text("Key")
+            Button("Key") { onSort(.key) }
+                .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Text("Value")
-                .frame(width: 130, alignment: .leading)
+                .frame(width: 170, alignment: .leading)
             Text("Environment")
                 .frame(width: 170, alignment: .leading)
             Text("Provider")
                 .frame(width: 150, alignment: .leading)
-            Text("Updated")
-                .frame(width: 170, alignment: .leading)
-            Text("Actions")
-                .frame(width: 80, alignment: .trailing)
+            Button("Updated") { onSort(.updatedAt) }
+                .buttonStyle(.plain)
+                .frame(width: 130, alignment: .leading)
+            Text("Actions / Notes")
+                .frame(width: 140, alignment: .trailing)
         }
         .font(.caption.weight(.semibold))
         .padding(.horizontal, 12)
@@ -389,21 +555,101 @@ private struct SecretTableHeaderRow: View {
 }
 
 private struct SecretTableRow: View {
+    private enum InlineField {
+        case key
+        case value
+        case provider
+    }
+
     let secret: Secret
     let environmentText: String
     let isHovered: Bool
+    let isFocused: Bool
     let isKeyCopied: Bool
     let isValueCopied: Bool
     let onCopyKey: () -> Void
     let onCopyValue: () -> Void
+    let onReadValue: () -> String?
+    let onInlineRename: (String) -> Void
+    let onInlineValueUpdate: (String) -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
+    let onQuickUpdateProvider: (String?) -> Void
+    let onQuickUpdateEnvironments: ([String]) -> Void
+
+    @State private var providerDraft = ""
+    @State private var showNotesPopover = false
+    @State private var isHoveringKeyCell = false
+    @State private var isHoveringValueCell = false
+    @State private var revealedValue: String?
+    @State private var revealHideTask: DispatchWorkItem?
+    @State private var isEditingKeyInline = false
+    @State private var isEditingValueInline = false
+    @State private var isEditingProviderInline = false
+    @State private var keyDraft = ""
+    @State private var valueDraft = ""
+    @State private var showKeyBlurPrompt = false
+    @State private var showValueBlurPrompt = false
+    @State private var showProviderBlurPrompt = false
+    @FocusState private var focusedInlineField: InlineField?
+
+    private var isValueRevealed: Bool {
+        revealedValue != nil
+    }
+
+    private var keyHasUnsavedChanges: Bool {
+        keyDraft.trimmingCharacters(in: .whitespacesAndNewlines) != secret.key
+    }
+
+    private var valueHasUnsavedChanges: Bool {
+        let trimmed = valueDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != (onReadValue() ?? "")
+    }
+
+    private var providerHasUnsavedChanges: Bool {
+        providerDraft.trimmingCharacters(in: .whitespacesAndNewlines) != (secret.provider ?? "")
+    }
 
     var body: some View {
         HStack(spacing: 12) {
             HStack(spacing: 6) {
-                Text(secret.key)
-                    .lineLimit(1)
+                if isEditingKeyInline {
+                    TextField("Secret key", text: $keyDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focusedInlineField, equals: .key)
+                        .onSubmit {
+                            commitInlineKeyEdit()
+                        }
+                        .onExitCommand {
+                            cancelInlineKeyEdit()
+                        }
+                    if keyHasUnsavedChanges {
+                        Text("Unsaved")
+                            .font(.caption2)
+                            .foregroundStyle(showKeyBlurPrompt ? .orange : .secondary)
+                    }
+                    Button {
+                        commitInlineKeyEdit()
+                    } label: {
+                        Image(systemName: "checkmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Save key")
+                    Button {
+                        cancelInlineKeyEdit()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Discard key changes")
+                } else {
+                    Text(secret.key)
+                        .lineLimit(1)
+                        .onTapGesture(count: 2) {
+                            beginInlineKeyEdit()
+                        }
+                }
+                Spacer(minLength: 0)
                 Button {
                     onCopyKey()
                 } label: {
@@ -411,45 +657,163 @@ private struct SecretTableRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("Copy key")
-                .opacity(isHovered ? 1 : 0)
+                .opacity((isHoveringKeyCell && !isEditingKeyInline) ? 1 : 0)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .onHover { isHovering in
+                isHoveringKeyCell = isHovering
+            }
 
             HStack(spacing: 6) {
-                Text("••••••••")
-                    .font(.body.monospaced())
-                Button {
-                    onCopyValue()
-                } label: {
-                    Image(systemName: isValueCopied ? "checkmark.circle.fill" : "doc.on.doc")
+                if isEditingValueInline {
+                    TextField("Secret value", text: $valueDraft)
+                        .font(.body.monospaced())
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .layoutPriority(1)
+                        .focused($focusedInlineField, equals: .value)
+                        .onSubmit {
+                            commitInlineValueEdit()
+                        }
+                        .onExitCommand {
+                            cancelInlineValueEdit()
+                        }
+                    if valueHasUnsavedChanges {
+                        Text("Unsaved")
+                            .font(.caption2)
+                            .foregroundStyle(showValueBlurPrompt ? .orange : .secondary)
+                    }
+                    Button {
+                        commitInlineValueEdit()
+                    } label: {
+                        Image(systemName: "checkmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Save value")
+                    Button {
+                        cancelInlineValueEdit()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Discard value changes")
+                } else {
+                    Text(revealedValue ?? "••••••••")
+                        .font(.body.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .onTapGesture(count: 2) {
+                            beginInlineValueEdit()
+                        }
+                    Spacer(minLength: 0)
+                    Button {
+                        onCopyValue()
+                    } label: {
+                        Image(systemName: isValueCopied ? "checkmark.circle.fill" : "doc.on.doc")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy value")
+                    .opacity((isHoveringValueCell || isValueRevealed) ? 1 : 0)
+                    Button {
+                        if isValueRevealed {
+                            hideRevealedValue()
+                        } else {
+                            revealValueForTwentySeconds()
+                        }
+                    } label: {
+                        Image(systemName: isValueRevealed ? "eye.slash" : "eye")
+                    }
+                    .buttonStyle(.plain)
+                    .help(isValueRevealed ? "Hide value" : "Show value for 20 seconds")
+                    .opacity((isHoveringValueCell || isValueRevealed) ? 1 : 0)
                 }
-                .buttonStyle(.plain)
-                .help("Copy value")
-                .opacity(isHovered ? 1 : 0)
             }
-            .frame(width: 130, alignment: .leading)
+            .frame(width: 170, alignment: .leading)
+            .onHover { isHovering in
+                isHoveringValueCell = isHovering
+            }
 
-            Text(environmentText)
-                .lineLimit(1)
-                .foregroundStyle(.secondary)
-                .frame(width: 170, alignment: .leading)
+            QuickEnvironmentEditor(
+                selectedEnvironments: Set(secret.environments),
+                onSave: { onQuickUpdateEnvironments(Array($0).sorted()) }
+            )
+            .frame(width: 170, alignment: .leading)
 
-            Text(secret.provider?.isEmpty == false ? secret.provider! : "—")
-                .lineLimit(1)
-                .foregroundStyle(.secondary)
-                .frame(width: 150, alignment: .leading)
+            HStack(spacing: 6) {
+                if isEditingProviderInline {
+                    TextField("Provider", text: $providerDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focusedInlineField, equals: .provider)
+                        .onSubmit {
+                            commitInlineProviderEdit()
+                        }
+                        .onExitCommand {
+                            cancelInlineProviderEdit()
+                        }
+                    if providerHasUnsavedChanges {
+                        Text("Unsaved")
+                            .font(.caption2)
+                            .foregroundStyle(showProviderBlurPrompt ? .orange : .secondary)
+                    }
+                    Button {
+                        commitInlineProviderEdit()
+                    } label: {
+                        Image(systemName: "checkmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Save provider")
+                    Button {
+                        cancelInlineProviderEdit()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Discard provider changes")
+                } else {
+                    Text(secret.provider?.isEmpty == false ? secret.provider! : "—")
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                        .onTapGesture(count: 2) {
+                            beginInlineProviderEdit()
+                        }
+                }
+            }
+            .frame(width: 150, alignment: .leading)
 
             Text(secret.updatedAt, style: .date)
                 .foregroundStyle(.secondary)
-                .frame(width: 170, alignment: .leading)
+                .frame(width: 130, alignment: .leading)
 
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 Button {
                     onEdit()
                 } label: {
                     Image(systemName: "pencil")
                 }
                 .help("Edit secret")
+
+                Button {
+                    showNotesPopover = true
+                } label: {
+                    Image(systemName: secret.notes == nil ? "note.text.badge.plus" : "note.text")
+                }
+                .help("View notes")
+                .popover(isPresented: $showNotesPopover) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(secret.key)
+                            .font(.headline)
+                        Text(secret.notes ?? "No notes yet.")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: 300, alignment: .leading)
+                        if let lastRotatedAt = secret.lastRotatedAt {
+                            Text("Last rotated: \(lastRotatedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding()
+                    .frame(width: 320)
+                }
 
                 Button(role: .destructive) {
                     onDelete()
@@ -461,11 +825,166 @@ private struct SecretTableRow: View {
             .buttonStyle(.borderless)
             .labelStyle(.iconOnly)
             .opacity(isHovered ? 1 : 0)
-            .frame(width: 80, alignment: .trailing)
+            .frame(width: 140, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(isHovered ? Color.accentColor.opacity(0.08) : Color.clear)
+        .background((isHovered || isFocused) ? Color.accentColor.opacity(0.08) : Color.clear)
+        .onDisappear {
+            revealHideTask?.cancel()
+        }
+        .onAppear {
+            keyDraft = secret.key
+        }
+        .onChange(of: focusedInlineField) { _, newFocusedField in
+            if isEditingKeyInline && newFocusedField != .key && keyHasUnsavedChanges {
+                showKeyBlurPrompt = true
+            } else if isEditingKeyInline && newFocusedField != .key && !keyHasUnsavedChanges {
+                isEditingKeyInline = false
+            }
+
+            if isEditingValueInline && newFocusedField != .value && valueHasUnsavedChanges {
+                showValueBlurPrompt = true
+            } else if isEditingValueInline && newFocusedField != .value && !valueHasUnsavedChanges {
+                isEditingValueInline = false
+            }
+
+            if isEditingProviderInline && newFocusedField != .provider && providerHasUnsavedChanges {
+                showProviderBlurPrompt = true
+            } else if isEditingProviderInline && newFocusedField != .provider && !providerHasUnsavedChanges {
+                isEditingProviderInline = false
+            }
+        }
+    }
+
+    private func revealValueForTwentySeconds() {
+        guard let value = onReadValue() else { return }
+        revealHideTask?.cancel()
+        revealedValue = value
+
+        let task = DispatchWorkItem {
+            hideRevealedValue()
+        }
+        revealHideTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: task)
+    }
+
+    private func hideRevealedValue() {
+        revealHideTask?.cancel()
+        revealHideTask = nil
+        revealedValue = nil
+    }
+
+    private func beginInlineKeyEdit() {
+        keyDraft = secret.key
+        isEditingKeyInline = true
+        showKeyBlurPrompt = false
+        focusedInlineField = .key
+    }
+
+    private func commitInlineKeyEdit() {
+        let trimmed = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            keyDraft = secret.key
+            isEditingKeyInline = false
+            showKeyBlurPrompt = false
+            return
+        }
+        if trimmed != secret.key {
+            onInlineRename(trimmed)
+        }
+        isEditingKeyInline = false
+        showKeyBlurPrompt = false
+        focusedInlineField = nil
+    }
+
+    private func cancelInlineKeyEdit() {
+        keyDraft = secret.key
+        isEditingKeyInline = false
+        showKeyBlurPrompt = false
+        focusedInlineField = nil
+    }
+
+    private func beginInlineValueEdit() {
+        valueDraft = revealedValue ?? onReadValue() ?? ""
+        isEditingValueInline = true
+        showValueBlurPrompt = false
+        focusedInlineField = .value
+        hideRevealedValue()
+    }
+
+    private func commitInlineValueEdit() {
+        let trimmed = valueDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            isEditingValueInline = false
+            showValueBlurPrompt = false
+            return
+        }
+        let currentValue = onReadValue() ?? ""
+        if trimmed != currentValue {
+            onInlineValueUpdate(trimmed)
+        }
+        isEditingValueInline = false
+        showValueBlurPrompt = false
+        focusedInlineField = nil
+    }
+
+    private func cancelInlineValueEdit() {
+        valueDraft = onReadValue() ?? ""
+        isEditingValueInline = false
+        showValueBlurPrompt = false
+        focusedInlineField = nil
+    }
+
+    private func beginInlineProviderEdit() {
+        providerDraft = secret.provider ?? ""
+        isEditingProviderInline = true
+        showProviderBlurPrompt = false
+        focusedInlineField = .provider
+    }
+
+    private func commitInlineProviderEdit() {
+        let trimmed = providerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = secret.provider ?? ""
+        if trimmed != current {
+            onQuickUpdateProvider(trimmed.isEmpty ? nil : trimmed)
+        }
+        isEditingProviderInline = false
+        showProviderBlurPrompt = false
+        focusedInlineField = nil
+    }
+
+    private func cancelInlineProviderEdit() {
+        providerDraft = secret.provider ?? ""
+        isEditingProviderInline = false
+        showProviderBlurPrompt = false
+        focusedInlineField = nil
+    }
+}
+
+private struct QuickEnvironmentEditor: View {
+    @State var selectedEnvironments: Set<String>
+    let onSave: (Set<String>) -> Void
+    private let options = ["dev", "staging", "prod"]
+
+    var body: some View {
+        Menu(selectedEnvironments.map { $0.capitalized }.sorted().joined(separator: ", ").ifEmpty("Set env")) {
+            ForEach(options, id: \.self) { option in
+                Button {
+                    if selectedEnvironments.contains(option) {
+                        selectedEnvironments.remove(option)
+                    } else {
+                        selectedEnvironments.insert(option)
+                    }
+                    if !selectedEnvironments.isEmpty {
+                        onSave(selectedEnvironments)
+                    }
+                } label: {
+                    Label(option.capitalized, systemImage: selectedEnvironments.contains(option) ? "checkmark.circle.fill" : "circle")
+                }
+            }
+        }
+        .menuStyle(.button)
     }
 }
 
@@ -532,10 +1051,11 @@ private struct NewSecretSheet: View {
     @State private var value = ""
     @State private var selectedEnvironments: Set<String> = ["dev"]
     @State private var provider = ""
+    @State private var notes = ""
 
     let workspaceID: UUID?
     let workspaces: [Workspace]
-    let onSave: (UUID, String, String, [String], String?) -> Void
+    let onSave: (UUID, String, String, [String], String?, String?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -554,6 +1074,7 @@ private struct NewSecretSheet: View {
             SecureField("Secret value", text: $value)
             EnvironmentSelectorRow(selectedEnvironments: $selectedEnvironments)
             TextField("Provider (optional)", text: $provider)
+            TextField("Notes (optional)", text: $notes)
 
             HStack {
                 Spacer()
@@ -561,7 +1082,14 @@ private struct NewSecretSheet: View {
                 Button("Save") {
                     guard let chosenWorkspaceID else { return }
                     let environments = selectedEnvironments.sorted()
-                    onSave(chosenWorkspaceID, key, value, environments, provider.isEmpty ? nil : provider)
+                    onSave(
+                        chosenWorkspaceID,
+                        key,
+                        value,
+                        environments,
+                        provider.isEmpty ? nil : provider,
+                        notes.isEmpty ? nil : notes
+                    )
                     dismiss()
                 }
                 .disabled(
@@ -586,15 +1114,17 @@ private struct EditSecretSheet: View {
     @State private var value = ""
     @State private var selectedEnvironments: Set<String>
     @State private var provider: String
+    @State private var notes: String
 
     let secret: Secret
-    let onSave: (String, String?, [String], String?) -> Void
+    let onSave: (String, String?, [String], String?, String?) -> Void
 
-    init(secret: Secret, onSave: @escaping (String, String?, [String], String?) -> Void) {
+    init(secret: Secret, onSave: @escaping (String, String?, [String], String?, String?) -> Void) {
         self.secret = secret
         self._key = State(initialValue: secret.key)
         self._selectedEnvironments = State(initialValue: Set(secret.environments))
         self._provider = State(initialValue: secret.provider ?? "")
+        self._notes = State(initialValue: secret.notes ?? "")
         self.onSave = onSave
     }
 
@@ -608,6 +1138,7 @@ private struct EditSecretSheet: View {
             SecureField("New value (optional)", text: $value)
             EnvironmentSelectorRow(selectedEnvironments: $selectedEnvironments)
             TextField("Provider (optional)", text: $provider)
+            TextField("Notes (optional)", text: $notes)
 
             HStack {
                 Spacer()
@@ -617,7 +1148,8 @@ private struct EditSecretSheet: View {
                         key,
                         value.isEmpty ? nil : value,
                         selectedEnvironments.sorted(),
-                        provider.isEmpty ? nil : provider
+                        provider.isEmpty ? nil : provider,
+                        notes.isEmpty ? nil : notes
                     )
                     dismiss()
                 }
@@ -664,6 +1196,387 @@ private struct EnvironmentSelectorRow: View {
             }
             Spacer()
         }
+    }
+}
+
+private struct EnvImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: AppStore
+
+    @State private var pastedText = ""
+    @State private var chosenWorkspaceID: UUID?
+    @State private var selectedEnvironments: Set<String> = ["dev"]
+    @State private var provider = ""
+    @State private var strategy: ImportConflictStrategy = .skip
+
+    let selectedWorkspaceID: UUID?
+    let workspaces: [Workspace]
+    let onImport: (UUID, [EnvImportEntry], [String], String?, ImportConflictStrategy) -> Void
+
+    private var parsedPreview: EnvImportParseResult {
+        EnvImportParser.parse(pastedText)
+    }
+
+    private var validEntries: [EnvImportEntry] {
+        parsedPreview.entries
+    }
+
+    private var canImport: Bool {
+        chosenWorkspaceID != nil && !selectedEnvironments.isEmpty && !validEntries.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Import .env")
+                .font(.title3)
+                .bold()
+
+            HStack(spacing: 12) {
+                Picker("Workspace", selection: $chosenWorkspaceID) {
+                    Text("Select workspace").tag(UUID?.none)
+                    ForEach(workspaces.sorted(by: { $0.name < $1.name })) { workspace in
+                        Text(workspace.name).tag(Optional(workspace.id))
+                    }
+                }
+                .frame(maxWidth: 260)
+
+                Picker("Conflict", selection: $strategy) {
+                    ForEach(ImportConflictStrategy.allCases) { option in
+                        Text(option.rawValue).tag(option)
+                    }
+                }
+                .frame(width: 160)
+
+                Spacer()
+            }
+
+            EnvironmentSelectorRow(selectedEnvironments: $selectedEnvironments)
+            TextField("Provider (optional, applied to imported rows)", text: $provider)
+
+            TextEditor(text: $pastedText)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 170)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                )
+
+            HStack {
+                Text("Preview")
+                    .font(.headline)
+                Spacer()
+                Text("Parsed \(parsedPreview.entries.count) • Errors \(parsedPreview.errors.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Table(parsedPreview.rows) {
+                TableColumn("Line") { row in
+                    Text("\(row.lineNumber)")
+                        .foregroundStyle(.secondary)
+                }
+                .width(50)
+
+                TableColumn("Key") { row in
+                    Text(row.key ?? "—")
+                        .lineLimit(1)
+                        .foregroundStyle(row.key == nil ? .secondary : .primary)
+                }
+                .width(min: 180, ideal: 220)
+
+                TableColumn("Value") { row in
+                    if let value = row.value {
+                        Text(value)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } else {
+                        Text("—")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .width(min: 220, ideal: 320)
+
+                TableColumn("Status") { row in
+                    if let error = row.error {
+                        Text(error)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                    } else if row.key != nil {
+                        if let key = row.key, let conflict = conflictDescription(for: key) {
+                            Text(conflict)
+                                .foregroundStyle(.orange)
+                                .lineLimit(1)
+                        } else {
+                            Text("Ready")
+                                .foregroundStyle(.green)
+                        }
+                    } else {
+                        Text("Ignored")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .width(min: 220, ideal: 280)
+            }
+            .frame(minHeight: 220)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Import") {
+                    guard let chosenWorkspaceID else { return }
+                    onImport(
+                        chosenWorkspaceID,
+                        validEntries,
+                        selectedEnvironments.sorted(),
+                        provider.isEmpty ? nil : provider,
+                        strategy
+                    )
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canImport)
+            }
+        }
+        .padding()
+        .frame(width: 920, height: 760)
+        .onAppear {
+            chosenWorkspaceID = selectedWorkspaceID ?? workspaces.first?.id
+        }
+    }
+
+    private func conflictDescription(for key: String) -> String? {
+        guard let chosenWorkspaceID else { return nil }
+        let environments = Set(selectedEnvironments.map { $0.lowercased() })
+        guard !environments.isEmpty else { return nil }
+        guard let conflict = store.secrets(in: chosenWorkspaceID).first(where: { secret in
+            let keyMatches = secret.key.caseInsensitiveCompare(key) == .orderedSame
+            let existingEnvironments = Set(secret.environments.map { $0.lowercased() })
+            return keyMatches && !existingEnvironments.isDisjoint(with: environments)
+        }) else {
+            return nil
+        }
+        let envText = conflict.environments.map { $0.capitalized }.joined(separator: ", ")
+        return "Conflicts with existing \(conflict.key) (\(envText))"
+    }
+}
+
+private struct EnvImportParseResult {
+    var rows: [EnvImportPreviewRow]
+    var entries: [EnvImportEntry]
+    var errors: [EnvImportPreviewRow]
+}
+
+private struct EnvImportPreviewRow: Identifiable {
+    let id = UUID()
+    let lineNumber: Int
+    let key: String?
+    let value: String?
+    let error: String?
+}
+
+private enum EnvImportParser {
+    static func parse(_ text: String) -> EnvImportParseResult {
+        var rows: [EnvImportPreviewRow] = []
+        var entries: [EnvImportEntry] = []
+        var errors: [EnvImportPreviewRow] = []
+
+        let lines = text.components(separatedBy: .newlines)
+        for (index, rawLine) in lines.enumerated() {
+            let lineNumber = index + 1
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed.isEmpty || trimmed.hasPrefix("#") {
+                rows.append(EnvImportPreviewRow(lineNumber: lineNumber, key: nil, value: nil, error: nil))
+                continue
+            }
+
+            let workingLine = trimmed.hasPrefix("export ") ? String(trimmed.dropFirst(7)) : trimmed
+            guard let equalsIndex = workingLine.firstIndex(of: "=") else {
+                let row = EnvImportPreviewRow(
+                    lineNumber: lineNumber,
+                    key: nil,
+                    value: nil,
+                    error: "Missing '=' delimiter."
+                )
+                rows.append(row)
+                errors.append(row)
+                continue
+            }
+
+            let rawKey = String(workingLine[..<equalsIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var rawValue = String(workingLine[workingLine.index(after: equalsIndex)...])
+            rawValue = rawValue.trimmingCharacters(in: .whitespaces)
+
+            guard !rawKey.isEmpty else {
+                let row = EnvImportPreviewRow(
+                    lineNumber: lineNumber,
+                    key: nil,
+                    value: nil,
+                    error: "Missing key name."
+                )
+                rows.append(row)
+                errors.append(row)
+                continue
+            }
+
+            guard isValidEnvKey(rawKey) else {
+                let row = EnvImportPreviewRow(
+                    lineNumber: lineNumber,
+                    key: rawKey,
+                    value: nil,
+                    error: "Invalid key format."
+                )
+                rows.append(row)
+                errors.append(row)
+                continue
+            }
+
+            do {
+                let parsedValue = try parseValue(rawValue)
+                let row = EnvImportPreviewRow(
+                    lineNumber: lineNumber,
+                    key: rawKey,
+                    value: parsedValue,
+                    error: nil
+                )
+                rows.append(row)
+                entries.append(
+                    EnvImportEntry(lineNumber: lineNumber, key: rawKey, value: parsedValue)
+                )
+            } catch {
+                let row = EnvImportPreviewRow(
+                    lineNumber: lineNumber,
+                    key: rawKey,
+                    value: nil,
+                    error: error.localizedDescription
+                )
+                rows.append(row)
+                errors.append(row)
+            }
+        }
+
+        return EnvImportParseResult(rows: rows, entries: entries, errors: errors)
+    }
+
+    private static func isValidEnvKey(_ key: String) -> Bool {
+        key.range(of: #"^[A-Za-z_][A-Za-z0-9_]*$"#, options: .regularExpression) != nil
+    }
+
+    private static func parseValue(_ rawValue: String) throws -> String {
+        guard let first = rawValue.first else { return "" }
+        if first == "\"" || first == "'" {
+            return try parseQuotedValue(rawValue, quote: first)
+        }
+        return parseUnquotedValue(rawValue)
+    }
+
+    private static func parseQuotedValue(_ raw: String, quote: Character) throws -> String {
+        var isEscaping = false
+        var output = ""
+        var foundClosingQuote = false
+        var endIndex = raw.startIndex
+        var index = raw.index(after: raw.startIndex)
+
+        while index < raw.endIndex {
+            let char = raw[index]
+            if isEscaping {
+                output.append(escapedCharacter(for: char))
+                isEscaping = false
+                index = raw.index(after: index)
+                continue
+            }
+            if char == "\\" {
+                isEscaping = true
+                index = raw.index(after: index)
+                continue
+            }
+            if char == quote {
+                foundClosingQuote = true
+                endIndex = raw.index(after: index)
+                break
+            }
+            output.append(char)
+            index = raw.index(after: index)
+        }
+
+        guard foundClosingQuote else {
+            throw EnvImportParseError.unterminatedQuote
+        }
+
+        let trailing = raw[endIndex...].trimmingCharacters(in: .whitespaces)
+        if !trailing.isEmpty && !trailing.hasPrefix("#") {
+            throw EnvImportParseError.invalidTrailingCharacters
+        }
+        return output
+    }
+
+    private static func parseUnquotedValue(_ raw: String) -> String {
+        var value = raw
+        if let commentIndex = value.firstIndex(of: "#") {
+            let prefix = value[..<commentIndex]
+            if prefix.last?.isWhitespace == true {
+                value = String(prefix)
+            }
+        }
+        return decodeEscapes(value.trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func decodeEscapes(_ text: String) -> String {
+        var output = ""
+        var isEscaping = false
+        for char in text {
+            if isEscaping {
+                output.append(escapedCharacter(for: char))
+                isEscaping = false
+            } else if char == "\\" {
+                isEscaping = true
+            } else {
+                output.append(char)
+            }
+        }
+        if isEscaping {
+            output.append("\\")
+        }
+        return output
+    }
+
+    private static func escapedCharacter(for char: Character) -> Character {
+        switch char {
+        case "n":
+            return "\n"
+        case "r":
+            return "\r"
+        case "t":
+            return "\t"
+        case "\\":
+            return "\\"
+        case "\"":
+            return "\""
+        case "'":
+            return "'"
+        default:
+            return char
+        }
+    }
+}
+
+private enum EnvImportParseError: LocalizedError {
+    case unterminatedQuote
+    case invalidTrailingCharacters
+
+    var errorDescription: String? {
+        switch self {
+        case .unterminatedQuote:
+            return "Quoted value is not closed."
+        case .invalidTrailingCharacters:
+            return "Invalid characters after closing quote."
+        }
+    }
+}
+
+private extension String {
+    func ifEmpty(_ fallback: String) -> String {
+        isEmpty ? fallback : self
     }
 }
 
