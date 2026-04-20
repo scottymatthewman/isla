@@ -6,16 +6,15 @@
 //
 
 import SwiftUI
-import CoreData
 
 @main
 struct islaApp: App {
-    let persistenceController = PersistenceController.shared
+    @StateObject private var appStore = AppStore()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environment(\.managedObjectContext, persistenceController.container.viewContext)
+                .environmentObject(appStore)
         }
     }
 }
