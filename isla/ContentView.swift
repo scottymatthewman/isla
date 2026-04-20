@@ -27,6 +27,7 @@ private enum ProviderFilter: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var security: AppSecurityController
 
     @State private var selectedWorkspaceID: UUID?
     @State private var showNewWorkspace = false
@@ -49,28 +50,7 @@ struct ContentView: View {
     private var filteredSecrets: [Secret] {
         guard let selectedWorkspaceID else { return [] }
         let base = store.secrets(in: selectedWorkspaceID)
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        return base.filter { secret in
-            let provider = secret.provider ?? ""
-            let environmentText = secret.environments.map(displayName(forEnvironment:)).joined(separator: " ")
-            let matchesSearch = query.isEmpty ||
-                secret.key.localizedCaseInsensitiveContains(query) ||
-                environmentText.localizedCaseInsensitiveContains(query) ||
-                provider.localizedCaseInsensitiveContains(query)
-            let matchesEnvironment = selectedEnvironmentFilters.isEmpty ||
-                !Set(secret.environments).isDisjoint(with: selectedEnvironmentFilters)
-            let hasProvider = !(secret.provider?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-            let matchesProvider: Bool
-            switch providerFilter {
-            case .all:
-                matchesProvider = true
-            case .withProvider:
-                matchesProvider = hasProvider
-            case .withoutProvider:
-                matchesProvider = !hasProvider
-            }
-            return matchesSearch && matchesEnvironment && matchesProvider
-        }
+        return base.filter(matchesBaseFilters)
     }
 
     private var visibleSecrets: [Secret] {
@@ -93,6 +73,7 @@ struct ContentView: View {
         } detail: {
             secretTableView
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Isla")
         .sheet(isPresented: $showNewWorkspace) {
             WorkspaceSheet(title: "New Workspace", confirmTitle: "Create", initialName: "") { name in
@@ -406,7 +387,6 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
                 )
-                .focusable()
                 .onMoveCommand { direction in
                     moveFocus(direction: direction)
                 }
@@ -431,6 +411,7 @@ struct ContentView: View {
         if let value = store.readSecretValue(secretID: secret.id) {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(value, forType: .string)
+            scheduleClipboardClear(for: value)
             copiedIndicator = .value(secret.id)
             focusedSecretID = secret.id
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -508,6 +489,42 @@ struct ContentView: View {
         }
     }
 
+    private func scheduleClipboardClear(for value: String) {
+        let pasteboard = NSPasteboard.general
+        let capturedChangeCount = pasteboard.changeCount
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+            let currentValue = pasteboard.string(forType: .string)
+            guard pasteboard.changeCount == capturedChangeCount, currentValue == value else {
+                return
+            }
+            pasteboard.clearContents()
+        }
+    }
+
+    private func matchesBaseFilters(_ secret: Secret) -> Bool {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let provider = secret.provider ?? ""
+        let environmentText = secret.environments.map(displayName(forEnvironment:)).joined(separator: " ")
+        let matchesSearch = query.isEmpty ||
+            secret.key.localizedCaseInsensitiveContains(query) ||
+            environmentText.localizedCaseInsensitiveContains(query) ||
+            provider.localizedCaseInsensitiveContains(query)
+        let matchesEnvironment = selectedEnvironmentFilters.isEmpty ||
+            !Set(secret.environments).isDisjoint(with: selectedEnvironmentFilters)
+        let hasProvider = !(secret.provider?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let matchesProvider: Bool
+        switch providerFilter {
+        case .all:
+            matchesProvider = true
+        case .withProvider:
+            matchesProvider = hasProvider
+        case .withoutProvider:
+            matchesProvider = !hasProvider
+        }
+        return matchesSearch && matchesEnvironment && matchesProvider
+    }
+
     private func displayName(forEnvironment environment: String) -> String {
         switch environment.lowercased() {
         case "dev":
@@ -545,7 +562,7 @@ private struct SecretTableHeaderRow: View {
                 .buttonStyle(.plain)
                 .frame(width: 130, alignment: .leading)
             Text("Actions / Notes")
-                .frame(width: 140, alignment: .trailing)
+                .frame(width: 200, alignment: .trailing)
         }
         .font(.caption.weight(.semibold))
         .padding(.horizontal, 12)
@@ -555,6 +572,8 @@ private struct SecretTableHeaderRow: View {
 }
 
 private struct SecretTableRow: View {
+    @EnvironmentObject private var security: AppSecurityController
+
     private enum InlineField {
         case key
         case value
@@ -805,11 +824,6 @@ private struct SecretTableRow: View {
                         Text(secret.notes ?? "No notes yet.")
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: 300, alignment: .leading)
-                        if let lastRotatedAt = secret.lastRotatedAt {
-                            Text("Last rotated: \(lastRotatedAt.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
                     }
                     .padding()
                     .frame(width: 320)
@@ -825,7 +839,7 @@ private struct SecretTableRow: View {
             .buttonStyle(.borderless)
             .labelStyle(.iconOnly)
             .opacity(isHovered ? 1 : 0)
-            .frame(width: 140, alignment: .trailing)
+            .frame(width: 200, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -835,6 +849,11 @@ private struct SecretTableRow: View {
         }
         .onAppear {
             keyDraft = secret.key
+        }
+        .onChange(of: security.isUnlocked) { _, isUnlocked in
+            if !isUnlocked {
+                hideRevealedValue()
+            }
         }
         .onChange(of: focusedInlineField) { _, newFocusedField in
             if isEditingKeyInline && newFocusedField != .key && keyHasUnsavedChanges {
@@ -1583,4 +1602,5 @@ private extension String {
 #Preview {
     ContentView()
         .environmentObject(AppStore())
+        .environmentObject(AppSecurityController())
 }

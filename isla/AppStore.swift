@@ -60,6 +60,9 @@ final class AppStore: ObservableObject {
         let affectedSecrets = secrets.filter { $0.workspaceID == workspaceID }
         for secret in affectedSecrets {
             try? keychain.delete(account: secret.keychainAccount)
+            if let notesKeychainAccount = secret.notesKeychainAccount {
+                try? keychain.delete(account: notesKeychainAccount)
+            }
         }
         secrets.removeAll { $0.workspaceID == workspaceID }
         workspaces.removeAll { $0.id == workspaceID }
@@ -99,7 +102,7 @@ final class AppStore: ObservableObject {
         try keychain.save(value: value, account: account)
 
         let cleanedProvider = normalizeProvider(provider)
-        let cleanedNotes = normalizeNotes(notes)
+        let (cleanedNotes, notesKeychainAccount) = try persistedNotes(notes)
 
         secrets.append(
             Secret(
@@ -110,6 +113,7 @@ final class AppStore: ObservableObject {
                 environments: cleanedEnvironments,
                 provider: cleanedProvider,
                 notes: cleanedNotes,
+                notesKeychainAccount: notesKeychainAccount,
                 providerMetadata: providerMetadata(for: cleanedProvider),
                 rotationCapability: .manual,
                 lastRotatedAt: nil,
@@ -155,12 +159,13 @@ final class AppStore: ObservableObject {
         }
 
         let cleanedProvider = normalizeProvider(provider)
-        let cleanedNotes = normalizeNotes(notes)
+        let (cleanedNotes, notesKeychainAccount) = try persistedNotes(notes, existingAccount: secret.notesKeychainAccount)
 
         secrets[index].key = cleanedKey
         secrets[index].environments = cleanedEnvironments
         secrets[index].provider = cleanedProvider
         secrets[index].notes = cleanedNotes
+        secrets[index].notesKeychainAccount = notesKeychainAccount
         secrets[index].providerMetadata = providerMetadata(for: cleanedProvider)
         secrets[index].updatedAt = Date()
         persist()
@@ -197,7 +202,9 @@ final class AppStore: ObservableObject {
         }
 
         if notes != nil {
-            secrets[index].notes = normalizeNotes(notes)
+            let (cleanedNotes, notesKeychainAccount) = try persistedNotes(notes, existingAccount: secret.notesKeychainAccount)
+            secrets[index].notes = cleanedNotes
+            secrets[index].notesKeychainAccount = notesKeychainAccount
         }
 
         secrets[index].updatedAt = Date()
@@ -241,6 +248,9 @@ final class AppStore: ObservableObject {
     func deleteSecret(secretID: UUID) {
         guard let secret = secrets.first(where: { $0.id == secretID }) else { return }
         try? keychain.delete(account: secret.keychainAccount)
+        if let notesKeychainAccount = secret.notesKeychainAccount {
+            try? keychain.delete(account: notesKeychainAccount)
+        }
         secrets.removeAll { $0.id == secretID }
         persist()
     }
@@ -373,18 +383,44 @@ final class AppStore: ObservableObject {
             let data = try Data(contentsOf: metadataURL)
             if let metadata = try? decoder.decode(AppMetadata.self, from: data) {
                 workspaces = metadata.workspaces
+                var didMigrateMetadata = false
                 secrets = metadata.secrets.map { secret in
                     var normalized = secret
                     if normalized.providerMetadata == nil {
                         normalized.providerMetadata = providerMetadata(for: normalized.provider)
+                        didMigrateMetadata = true
+                    }
+                    if let notesKeychainAccount = normalized.notesKeychainAccount {
+                        normalized.notes = try? keychain.read(account: notesKeychainAccount)
+                    } else if let legacyNotes = normalizeNotes(normalized.notes) {
+                        let notesKeychainAccount = "notes-\(UUID().uuidString)"
+                        do {
+                            try keychain.save(value: legacyNotes, account: notesKeychainAccount)
+                            normalized.notes = legacyNotes
+                            normalized.notesKeychainAccount = notesKeychainAccount
+                            didMigrateMetadata = true
+                        } catch {
+                            normalized.notes = legacyNotes
+                        }
                     }
                     return normalized
+                }
+                if didMigrateMetadata {
+                    persist()
                 }
             } else {
                 let legacy = try decoder.decode(LegacyAppMetadata.self, from: data)
                 let migratedSecrets: [Secret] = legacy.secrets.compactMap { legacySecret in
                     guard let project = legacy.projects.first(where: { $0.id == legacySecret.projectID }) else {
                         return nil
+                    }
+                    let notesKeychainAccount: String?
+                    if let legacyNotes = normalizeNotes(legacySecret.notes) {
+                        let account = "notes-\(UUID().uuidString)"
+                        try? keychain.save(value: legacyNotes, account: account)
+                        notesKeychainAccount = account
+                    } else {
+                        notesKeychainAccount = nil
                     }
                     return Secret(
                         id: legacySecret.id,
@@ -394,6 +430,7 @@ final class AppStore: ObservableObject {
                         environments: [legacySecret.environment],
                         provider: legacySecret.provider,
                         notes: legacySecret.notes,
+                        notesKeychainAccount: notesKeychainAccount,
                         createdAt: legacySecret.createdAt,
                         updatedAt: legacySecret.updatedAt
                     )
@@ -475,6 +512,20 @@ final class AppStore: ObservableObject {
     private func normalizeNotes(_ notes: String?) -> String? {
         let normalized = notes?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (normalized?.isEmpty == true) ? nil : normalized
+    }
+
+    private func persistedNotes(_ notes: String?, existingAccount: String? = nil) throws -> (String?, String?) {
+        let normalizedNotes = normalizeNotes(notes)
+        guard let normalizedNotes else {
+            if let existingAccount {
+                try? keychain.delete(account: existingAccount)
+            }
+            return (nil, nil)
+        }
+
+        let account = existingAccount ?? "notes-\(UUID().uuidString)"
+        try keychain.save(value: normalizedNotes, account: account)
+        return (normalizedNotes, account)
     }
 
     private func providerMetadata(for provider: String?) -> ProviderMetadata? {

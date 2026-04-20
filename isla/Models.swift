@@ -15,6 +15,7 @@ struct Secret: Identifiable, Codable, Hashable {
     var environments: [String]
     var provider: String?
     var notes: String?
+    var notesKeychainAccount: String?
     var providerMetadata: ProviderMetadata?
     var rotationCapability: RotationCapability
     var lastRotatedAt: Date?
@@ -31,6 +32,7 @@ struct Secret: Identifiable, Codable, Hashable {
         case environment
         case provider
         case notes
+        case notesKeychainAccount
         case providerMetadata
         case rotationCapability
         case lastRotatedAt
@@ -47,6 +49,7 @@ struct Secret: Identifiable, Codable, Hashable {
         environments: [String],
         provider: String?,
         notes: String?,
+        notesKeychainAccount: String? = nil,
         providerMetadata: ProviderMetadata? = nil,
         rotationCapability: RotationCapability = .manual,
         lastRotatedAt: Date? = nil,
@@ -61,6 +64,7 @@ struct Secret: Identifiable, Codable, Hashable {
         self.environments = environments
         self.provider = provider
         self.notes = notes
+        self.notesKeychainAccount = notesKeychainAccount
         self.providerMetadata = providerMetadata
         self.rotationCapability = rotationCapability
         self.lastRotatedAt = lastRotatedAt
@@ -86,6 +90,7 @@ struct Secret: Identifiable, Codable, Hashable {
 
         provider = try container.decodeIfPresent(String.self, forKey: .provider)
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        notesKeychainAccount = try container.decodeIfPresent(String.self, forKey: .notesKeychainAccount)
         providerMetadata = try container.decodeIfPresent(ProviderMetadata.self, forKey: .providerMetadata)
         rotationCapability = try container.decodeIfPresent(RotationCapability.self, forKey: .rotationCapability) ?? .manual
         lastRotatedAt = try container.decodeIfPresent(Date.self, forKey: .lastRotatedAt)
@@ -102,8 +107,7 @@ struct Secret: Identifiable, Codable, Hashable {
         try container.encode(keychainAccount, forKey: .keychainAccount)
         try container.encode(environments, forKey: .environments)
         try container.encodeIfPresent(provider, forKey: .provider)
-        try container.encodeIfPresent(notes, forKey: .notes)
-        try container.encodeIfPresent(providerMetadata, forKey: .providerMetadata)
+        try container.encodeIfPresent(notesKeychainAccount, forKey: .notesKeychainAccount)
         try container.encode(rotationCapability, forKey: .rotationCapability)
         try container.encodeIfPresent(lastRotatedAt, forKey: .lastRotatedAt)
         try container.encode(rotationHistory, forKey: .rotationHistory)

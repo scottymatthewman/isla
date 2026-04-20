@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		9F7726162F967361008D4DD1 /* IslaIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 9F7726152F967361008D4DD1 /* IslaIcon.icon */; };
+		9F7726B52F96B0A0008D4DD1 /* IslaIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = 9F7726B42F96B0A0008D4DD1 /* IslaIcon.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -31,7 +31,7 @@
 		9F1F2C172F834DCD000DDE29 /* isla.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = isla.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9F1F2C292F834DCF000DDE29 /* islaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = islaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		9F1F2C332F834DCF000DDE29 /* islaUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = islaUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		9F7726152F967361008D4DD1 /* IslaIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = IslaIcon.icon; sourceTree = "<group>"; };
+		9F7726B42F96B0A0008D4DD1 /* IslaIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = IslaIcon.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -80,7 +80,7 @@
 		9F1F2C0E2F834DCD000DDE29 = {
 			isa = PBXGroup;
 			children = (
-				9F7726152F967361008D4DD1 /* IslaIcon.icon */,
+				9F7726B42F96B0A0008D4DD1 /* IslaIcon.icon */,
 				9F1F2C192F834DCD000DDE29 /* isla */,
 				9F1F2C2C2F834DCF000DDE29 /* islaTests */,
 				9F1F2C362F834DCF000DDE29 /* islaUITests */,
@@ -218,7 +218,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				9F7726162F967361008D4DD1 /* IslaIcon.icon in Resources */,
+				9F7726B52F96B0A0008D4DD1 /* IslaIcon.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
