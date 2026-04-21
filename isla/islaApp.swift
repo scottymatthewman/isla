@@ -10,6 +10,22 @@ import AppKit
 import Combine
 import LocalAuthentication
 
+private enum AppLockDefaults {
+    static let autoLockIdleMinutesKey = "isla.autoLockIdleMinutes"
+    static let requireAuthOnLaunchKey = "isla.requireAuthenticationOnLaunch"
+
+    /// 0 = never auto-lock from idle (launch lock still applies when enabled).
+    static var autoLockIdleMinutes: Int {
+        let raw = UserDefaults.standard.object(forKey: autoLockIdleMinutesKey) as? Int
+        return raw ?? 60
+    }
+
+    static var requireAuthenticationOnLaunch: Bool {
+        if UserDefaults.standard.object(forKey: requireAuthOnLaunchKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: requireAuthOnLaunchKey)
+    }
+}
+
 @main
 struct islaApp: App {
     @Environment(\.scenePhase) private var scenePhase
@@ -38,6 +54,11 @@ struct islaApp: App {
                 }
         }
         .defaultSize(width: 1180, height: 860)
+
+        Settings {
+            AppLockSettingsView()
+                .environmentObject(security)
+        }
     }
 }
 
@@ -47,13 +68,18 @@ final class AppSecurityController: ObservableObject {
     @Published private(set) var isAuthenticating = false
     @Published var unlockError: String?
 
-    private let autoLockInterval: TimeInterval = 60 * 60
     private var lastInteractionAt = Date()
     private var eventMonitor: Any?
     private var inactivityTimer: Timer?
     private var isSceneActive = false
+    private var lastScenePhase: ScenePhase?
 
     init() {
+        if !AppLockDefaults.requireAuthenticationOnLaunch {
+            isUnlocked = true
+            lastInteractionAt = Date()
+        }
+
         eventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .flagsChanged, .scrollWheel]
         ) { [weak self] event in
@@ -80,13 +106,21 @@ final class AppSecurityController: ObservableObject {
     func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .active:
+            // Sleep or another app in front should not burn down the idle timer; only time
+            // while active and unlocked should count toward auto-lock.
+            if isUnlocked, lastScenePhase.map({ $0 == .inactive || $0 == .background }) == true {
+                lastInteractionAt = Date()
+            }
             isSceneActive = true
             evaluateAutoLock()
             requestUnlockIfNeeded()
             registerInteraction()
+            lastScenePhase = phase
         case .inactive, .background:
             isSceneActive = false
+            lastScenePhase = phase
         @unknown default:
+            lastScenePhase = phase
             break
         }
     }
@@ -120,9 +154,26 @@ final class AppSecurityController: ObservableObject {
         }
     }
 
+    /// Reflects changes from Settings (immediate); launch behavior uses `AppLockDefaults` on next cold start.
+    func applyLaunchAuthPreference(requireAuthentication: Bool) {
+        if requireAuthentication {
+            isUnlocked = false
+            unlockError = nil
+            if isSceneActive {
+                requestUnlockIfNeeded()
+            }
+        } else {
+            isUnlocked = true
+            lastInteractionAt = Date()
+        }
+    }
+
     private func evaluateAutoLock() {
         guard isUnlocked else { return }
-        guard Date().timeIntervalSince(lastInteractionAt) >= autoLockInterval else { return }
+        let minutes = AppLockDefaults.autoLockIdleMinutes
+        guard minutes > 0 else { return }
+        let interval = TimeInterval(minutes * 60)
+        guard Date().timeIntervalSince(lastInteractionAt) >= interval else { return }
         isUnlocked = false
         unlockError = nil
         if isSceneActive {
@@ -151,6 +202,42 @@ final class AppSecurityController: ObservableObject {
                     continuation.resume(returning: (false, error?.localizedDescription ?? "Authentication failed."))
                 }
             }
+        }
+    }
+}
+
+private struct AppLockSettingsView: View {
+    @EnvironmentObject private var security: AppSecurityController
+    @AppStorage(AppLockDefaults.autoLockIdleMinutesKey) private var autoLockIdleMinutes = 60
+    @AppStorage(AppLockDefaults.requireAuthOnLaunchKey) private var requireAuthenticationOnLaunch = true
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("Lock after inactivity while Isla is open", selection: $autoLockIdleMinutes) {
+                    Text("Never").tag(0)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("2 hours").tag(120)
+                    Text("4 hours").tag(240)
+                    Text("8 hours").tag(480)
+                }
+                Toggle("Require Touch ID or password when Isla opens", isOn: $requireAuthenticationOnLaunch)
+            } header: {
+                Text("App lock")
+            } footer: {
+                Text(
+                    "Isla uses the same login as your Mac (Touch ID or account password). " +
+                    "Turning off “when Isla opens” is convenient on a trusted machine but lets anyone who can use your Mac session see secrets without another prompt."
+                )
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 420)
+        .padding()
+        .onChange(of: requireAuthenticationOnLaunch) { _, newValue in
+            security.applyLaunchAuthPreference(requireAuthentication: newValue)
         }
     }
 }
