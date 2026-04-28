@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 private enum SecretSortOption: String, CaseIterable, Identifiable {
     case updatedNewest = "Updated (Newest)"
@@ -39,6 +40,8 @@ struct ContentView: View {
     @State private var createSecretError: String?
     @State private var importSummary: EnvImportSummary?
     @State private var hoveredSecretID: UUID?
+    @State private var selectedSecretIDs: Set<UUID> = []
+    @State private var showBulkEnvironmentSheet = false
     @State private var editingSecret: Secret?
     @State private var deletingSecret: Secret?
     @State private var copiedIndicator: CopiedIndicator?
@@ -97,6 +100,20 @@ struct ContentView: View {
                     createSecretError = nil
                 } catch {
                     createSecretError = (error as? LocalizedError)?.errorDescription ?? "Could not save secret value to Keychain."
+                }
+            }
+        }
+        .sheet(isPresented: $showBulkEnvironmentSheet) {
+            BulkEditSecretEnvironmentsSheet(selectedCount: selectedSecretIDs.count) { environments in
+                do {
+                    try store.bulkUpdateSecretEnvironments(secretIDs: selectedSecretIDs, environments: environments)
+                    createSecretError = nil
+                    selectedSecretIDs.removeAll()
+                    return nil
+                } catch {
+                    let message = (error as? LocalizedError)?.errorDescription ?? "Could not update environments."
+                    createSecretError = message
+                    return message
                 }
             }
         }
@@ -161,6 +178,7 @@ struct ContentView: View {
             Button("Delete", role: .destructive) {
                 if let deletingSecret {
                     store.deleteSecret(secretID: deletingSecret.id)
+                    selectedSecretIDs.remove(deletingSecret.id)
                     self.deletingSecret = nil
                 }
             }
@@ -174,6 +192,9 @@ struct ContentView: View {
             if selectedWorkspaceID == nil {
                 selectedWorkspaceID = store.workspaces.first?.id
             }
+        }
+        .onChange(of: selectedWorkspaceID) { _, _ in
+            selectedSecretIDs.removeAll()
         }
     }
 
@@ -230,11 +251,30 @@ struct ContentView: View {
                 }
                 .disabled(selectedWorkspaceID == nil)
                 Button {
+                    showBulkEnvironmentSheet = true
+                } label: {
+                    Label("Set environments for selection", systemImage: "square.stack.3d.up")
+                }
+                .disabled(selectedWorkspaceID == nil || selectedSecretIDs.isEmpty)
+                Button {
                     showEnvImport = true
                 } label: {
                     Label("Import .env", systemImage: "square.and.arrow.down")
                 }
                 .disabled(store.workspaces.isEmpty)
+            }
+
+            if !selectedSecretIDs.isEmpty {
+                HStack(spacing: 8) {
+                    Text("\(selectedSecretIDs.count) secret\(selectedSecretIDs.count == 1 ? "" : "s") selected")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button("Clear selection") {
+                        selectedSecretIDs.removeAll()
+                    }
+                    .buttonStyle(.borderless)
+                    Spacer()
+                }
             }
 
             HStack(spacing: 12) {
@@ -296,7 +336,10 @@ struct ContentView: View {
                 )
             } else {
                 VStack(spacing: 0) {
-                    SecretTableHeaderRow { column in
+                    SecretTableHeaderRow(
+                        allVisibleSelected: allVisibleSecretsSelected,
+                        onToggleSelectAllVisible: toggleSelectAllVisibleSecrets
+                    ) { column in
                         sortByColumn(column)
                     }
                     ScrollView {
@@ -304,6 +347,16 @@ struct ContentView: View {
                             ForEach(visibleSecrets) { secret in
                                 SecretTableRow(
                                     secret: secret,
+                                    isRowSelected: selectedSecretIDs.contains(secret.id),
+                                    onToggleRowSelection: {
+                                        var next = selectedSecretIDs
+                                        if next.contains(secret.id) {
+                                            next.remove(secret.id)
+                                        } else {
+                                            next.insert(secret.id)
+                                        }
+                                        selectedSecretIDs = next
+                                    },
                                     environmentText: secret.environments.map(displayName(forEnvironment:)).joined(separator: ", "),
                                     isHovered: hoveredSecretID == secret.id,
                                     isFocused: focusedSecretID == secret.id,
@@ -481,6 +534,19 @@ struct ContentView: View {
         deletingSecret = secret
     }
 
+    private var allVisibleSecretsSelected: Bool {
+        !visibleSecrets.isEmpty && visibleSecrets.allSatisfy { selectedSecretIDs.contains($0.id) }
+    }
+
+    private func toggleSelectAllVisibleSecrets() {
+        let visibleIDs = Set(visibleSecrets.map(\.id))
+        if allVisibleSecretsSelected {
+            selectedSecretIDs = selectedSecretIDs.subtracting(visibleIDs)
+        } else {
+            selectedSecretIDs = selectedSecretIDs.union(visibleIDs)
+        }
+    }
+
     private func toggleEnvironmentFilter(_ environment: String) {
         if selectedEnvironmentFilters.contains(environment) {
             selectedEnvironmentFilters.remove(environment)
@@ -545,10 +611,20 @@ private enum CopiedIndicator: Equatable {
 }
 
 private struct SecretTableHeaderRow: View {
+    var allVisibleSelected: Bool = false
+    let onToggleSelectAllVisible: () -> Void
     let onSort: (SecretSortColumn) -> Void
 
     var body: some View {
         HStack(spacing: 12) {
+            Toggle("", isOn: Binding(
+                get: { allVisibleSelected },
+                set: { _ in onToggleSelectAllVisible() }
+            ))
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .frame(width: 28, alignment: .center)
+            .help("Select all visible secrets")
             Button("Key") { onSort(.key) }
                 .buttonStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -581,6 +657,8 @@ private struct SecretTableRow: View {
     }
 
     let secret: Secret
+    var isRowSelected: Bool = false
+    var onToggleRowSelection: (() -> Void)?
     let environmentText: String
     let isHovered: Bool
     let isFocused: Bool
@@ -631,6 +709,15 @@ private struct SecretTableRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            if let onToggleRowSelection {
+                Toggle("", isOn: Binding(
+                    get: { isRowSelected },
+                    set: { _ in onToggleRowSelection() }
+                ))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .frame(width: 28, alignment: .center)
+            }
             HStack(spacing: 6) {
                 if isEditingKeyInline {
                     TextField("Secret key", text: $keyDraft)
@@ -1183,6 +1270,52 @@ private struct EditSecretSheet: View {
     }
 }
 
+private struct BulkEditSecretEnvironmentsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedEnvironments: Set<String> = ["dev"]
+    @State private var applyError: String?
+
+    let selectedCount: Int
+    /// Return `nil` on success, or an error message to show in the sheet.
+    let onApply: ([String]) -> String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Set environments for \(selectedCount) secret\(selectedCount == 1 ? "" : "s")")
+                .font(.title3)
+                .bold()
+
+            Text("Every selected row gets this exact environment list (replacing what it had before).")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            EnvironmentSelectorRow(selectedEnvironments: $selectedEnvironments)
+
+            if let applyError {
+                Text(applyError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Apply") {
+                    applyError = nil
+                    if let message = onApply(selectedEnvironments.sorted()) {
+                        applyError = message
+                    } else {
+                        dismiss()
+                    }
+                }
+                .disabled(selectedEnvironments.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 480)
+    }
+}
+
 private struct EnvironmentSelectorRow: View {
     @Binding var selectedEnvironments: Set<String>
     private let options: [(key: String, title: String)] = [
@@ -1223,10 +1356,22 @@ private struct EnvImportSheet: View {
     @EnvironmentObject private var store: AppStore
 
     @State private var pastedText = ""
+    @State private var importedFileName: String?
+    @State private var showFileImporter = false
+    @State private var fileImportError: String?
     @State private var chosenWorkspaceID: UUID?
     @State private var selectedEnvironments: Set<String> = ["dev"]
     @State private var provider = ""
     @State private var strategy: ImportConflictStrategy = .skip
+
+    /// Types allowed in the open panel — `.env` is not always exported as its own UTType on disk.
+    private static let fileImporterContentTypes: [UTType] = {
+        var types: [UTType] = [.plainText]
+        if let env = UTType(filenameExtension: "env") {
+            types.append(env)
+        }
+        return types
+    }()
 
     let selectedWorkspaceID: UUID?
     let workspaces: [Workspace]
@@ -1271,6 +1416,29 @@ private struct EnvImportSheet: View {
 
             EnvironmentSelectorRow(selectedEnvironments: $selectedEnvironments)
             TextField("Provider (optional, applied to imported rows)", text: $provider)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 12) {
+                    Button("Choose .env file…") {
+                        fileImportError = nil
+                        showFileImporter = true
+                    }
+
+                    if let importedFileName {
+                        Text(importedFileName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+                }
+
+                Text("Paste your `.env` below, or load a file. You can still edit text after loading.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             TextEditor(text: $pastedText)
                 .font(.system(.body, design: .monospaced))
@@ -1360,6 +1528,41 @@ private struct EnvImportSheet: View {
         .frame(width: 920, height: 760)
         .onAppear {
             chosenWorkspaceID = selectedWorkspaceID ?? workspaces.first?.id
+        }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: Self.fileImporterContentTypes,
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .failure(let error):
+                fileImportError = error.localizedDescription
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                let didAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if didAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                do {
+                    let text = try String(contentsOf: url, encoding: .utf8)
+                    pastedText = text
+                    importedFileName = url.lastPathComponent
+                } catch {
+                    fileImportError = error.localizedDescription
+                }
+            }
+        }
+        .alert("Could not read file", isPresented: Binding(
+            get: { fileImportError != nil },
+            set: { if !$0 { fileImportError = nil } }
+        )) {
+            Button("OK") { fileImportError = nil }
+        } message: {
+            if let fileImportError {
+                Text(fileImportError)
+            }
         }
     }
 

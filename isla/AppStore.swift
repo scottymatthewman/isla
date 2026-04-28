@@ -211,6 +211,44 @@ final class AppStore: ObservableObject {
         persist()
     }
 
+    /// Sets the same environment list on many secrets at once. Validates that the resulting workspace
+    /// has no duplicate (key + overlapping environment) rows.
+    func bulkUpdateSecretEnvironments(secretIDs: Set<UUID>, environments: [String]) throws {
+        let cleanedEnvironments = environments
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !cleanedEnvironments.isEmpty else {
+            throw AppStoreError.invalidInput
+        }
+        guard !secretIDs.isEmpty else { return }
+
+        func proposedEnvironments(for secret: Secret) -> [String] {
+            secretIDs.contains(secret.id) ? cleanedEnvironments : secret.environments
+        }
+
+        for secret in secrets {
+            let envs = proposedEnvironments(for: secret)
+            let normalizedEnv = Set(envs.map { $0.lowercased() })
+            for other in secrets {
+                guard other.id != secret.id else { continue }
+                guard other.workspaceID == secret.workspaceID else { continue }
+                guard other.key.lowercased() == secret.key.lowercased() else { continue }
+                let otherEnv = Set(proposedEnvironments(for: other).map { $0.lowercased() })
+                if !normalizedEnv.isDisjoint(with: otherEnv) {
+                    throw AppStoreError.duplicateSecret
+                }
+            }
+        }
+
+        let now = Date()
+        for id in secretIDs {
+            guard let index = secrets.firstIndex(where: { $0.id == id }) else { continue }
+            secrets[index].environments = cleanedEnvironments
+            secrets[index].updatedAt = now
+        }
+        persist()
+    }
+
     func updateSecretInline(secretID: UUID, key: String? = nil, value: String? = nil) throws {
         guard let index = secrets.firstIndex(where: { $0.id == secretID }) else {
             throw AppStoreError.notFound
