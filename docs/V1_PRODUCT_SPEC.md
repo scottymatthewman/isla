@@ -1,5 +1,7 @@
 # Isla v1 Product Specification (macOS)
 
+This is the original v1 design. The app now organizes secrets by workspace; the earlier project layer was folded into workspaces. Where this document and the code disagree, the code is the source of truth.
+
 ## 1) Product Intent
 
 Isla is a macOS app for indie and solo developers to securely store, organize, and use API keys and related secrets with minimal friction.
